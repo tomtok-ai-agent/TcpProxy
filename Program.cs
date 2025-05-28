@@ -11,6 +11,7 @@ namespace TcpProxy
     /// <summary>
     /// TCP Proxy application that forwards TCP traffic between a local endpoint and a remote endpoint.
     /// Supports multiple concurrent sessions and handles connection instability.
+    /// Uses only Socket class from System.Net.Sockets namespace.
     /// </summary>
     class Program
     {
@@ -163,59 +164,72 @@ namespace TcpProxy
 
         /// <summary>
         /// Runs the TCP proxy server, listening for incoming connections and forwarding them.
+        /// Uses Socket class instead of TcpListener.
         /// </summary>
         /// <param name="localEndpoint">Local endpoint to listen on</param>
         /// <param name="remoteEndpoint">Remote endpoint to forward to</param>
         /// <param name="cancellationToken">Cancellation token for shutdown</param>
         private static async Task RunProxyServer(IPEndPoint localEndpoint, IPEndPoint remoteEndpoint, CancellationToken cancellationToken)
         {
-            // Create and configure the TCP listener
-            TcpListener listener = new TcpListener(localEndpoint);
-            listener.Start();
-
-            Log(VerbosityLevel.Standard, $"TCP Proxy started. Listening on {localEndpoint}, forwarding to {remoteEndpoint}");
-            Log(VerbosityLevel.Standard, $"Verbosity level: {_verbosityLevel}");
-
+            // Create and configure the listener socket
+            Socket listenerSocket = new Socket(localEndpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            
             try
             {
+                // Bind and start listening
+                listenerSocket.Bind(localEndpoint);
+                listenerSocket.Listen(100); // Backlog of 100 connections
+                
+                Log(VerbosityLevel.Standard, $"TCP Proxy started. Listening on {localEndpoint}, forwarding to {remoteEndpoint}");
+                Log(VerbosityLevel.Standard, $"Verbosity level: {_verbosityLevel}");
+
+                // Create a task completion source for cancellation
+                var acceptCancellation = new TaskCompletionSource<bool>();
+                cancellationToken.Register(() => acceptCancellation.TrySetResult(true));
+
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    // Wait for a client connection with cancellation support
-                    TcpClient clientConnection;
-                    try
+                    // Begin accepting a connection asynchronously
+                    var acceptTask = AcceptConnectionAsync(listenerSocket);
+                    
+                    // Wait for either a connection or cancellation
+                    var completedTask = await Task.WhenAny(acceptTask, acceptCancellation.Task);
+                    
+                    if (completedTask == acceptCancellation.Task)
                     {
-                        // Use AcceptTcpClientAsync with cancellation token
-                        var acceptTask = listener.AcceptTcpClientAsync();
-                        var completedTask = await Task.WhenAny(acceptTask, Task.Delay(-1, cancellationToken));
-                        
-                        if (completedTask == acceptTask)
-                        {
-                            clientConnection = await acceptTask;
-                        }
-                        else
-                        {
-                            // Cancellation was requested
-                            break;
-                        }
-                    }
-                    catch (OperationCanceledException)
-                    {
+                        // Cancellation was requested
                         break;
                     }
-                    catch (Exception ex)
+                    
+                    // Get the client socket
+                    Socket clientSocket = await acceptTask;
+                    
+                    if (clientSocket == null)
                     {
-                        Log(VerbosityLevel.Standard, $"Error accepting client connection: {ex.Message}");
+                        // Accept failed but not due to cancellation
                         continue;
                     }
-
+                    
                     // Handle the client connection in a separate task
-                    _ = HandleClientConnectionAsync(clientConnection, remoteEndpoint, cancellationToken);
+                    _ = HandleClientConnectionAsync(clientSocket, remoteEndpoint, cancellationToken);
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected during cancellation
+            }
+            catch (Exception ex)
+            {
+                Log(VerbosityLevel.Standard, $"Error in proxy server: {ex.Message}");
             }
             finally
             {
                 // Clean up resources
-                listener.Stop();
+                try
+                {
+                    listenerSocket.Close();
+                }
+                catch { /* Ignore errors during cleanup */ }
                 
                 // Close all active sessions
                 foreach (var session in ActiveSessions.Values)
@@ -228,17 +242,55 @@ namespace TcpProxy
         }
 
         /// <summary>
-        /// Handles a client connection by establishing a connection to the remote endpoint and forwarding data.
+        /// Accepts a client connection asynchronously.
         /// </summary>
-        /// <param name="clientConnection">The client TCP connection</param>
+        /// <param name="listenerSocket">The listener socket</param>
+        /// <returns>The client socket if successful, null otherwise</returns>
+        private static async Task<Socket> AcceptConnectionAsync(Socket listenerSocket)
+        {
+            try
+            {
+                // Create a task completion source for the accept operation
+                var tcs = new TaskCompletionSource<Socket>();
+                
+                // Begin accepting a connection
+                listenerSocket.BeginAccept(ar => 
+                {
+                    try
+                    {
+                        // Complete the accept operation
+                        Socket clientSocket = listenerSocket.EndAccept(ar);
+                        tcs.SetResult(clientSocket);
+                    }
+                    catch (Exception ex)
+                    {
+                        tcs.SetException(ex);
+                    }
+                }, null);
+                
+                // Wait for the accept operation to complete
+                return await tcs.Task;
+            }
+            catch (Exception ex)
+            {
+                Log(VerbosityLevel.Standard, $"Error accepting client connection: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Handles a client connection by establishing a connection to the remote endpoint and forwarding data.
+        /// Uses Socket class instead of TcpClient.
+        /// </summary>
+        /// <param name="clientSocket">The client socket</param>
         /// <param name="remoteEndpoint">The remote endpoint to connect to</param>
         /// <param name="cancellationToken">Cancellation token for shutdown</param>
-        private static async Task HandleClientConnectionAsync(TcpClient clientConnection, IPEndPoint remoteEndpoint, CancellationToken cancellationToken)
+        private static async Task HandleClientConnectionAsync(Socket clientSocket, IPEndPoint remoteEndpoint, CancellationToken cancellationToken)
         {
             string sessionId = Guid.NewGuid().ToString("N");
-            var clientEndpoint = (IPEndPoint)clientConnection.Client.RemoteEndPoint;
+            var clientEndpoint = (IPEndPoint)clientSocket.RemoteEndPoint;
             
-            var session = new ProxySession(sessionId, clientConnection, clientEndpoint, remoteEndpoint);
+            var session = new ProxySession(sessionId, clientSocket, clientEndpoint, remoteEndpoint);
             ActiveSessions.TryAdd(sessionId, session);
             
             Log(VerbosityLevel.Standard, $"New connection from {clientEndpoint}. Session ID: {sessionId}. Active sessions: {ActiveSessions.Count}");
@@ -246,33 +298,34 @@ namespace TcpProxy
             try
             {
                 // Connect to the remote endpoint
-                TcpClient remoteConnection = new TcpClient();
+                Socket remoteSocket = new Socket(remoteEndpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                
                 try
                 {
-                    await remoteConnection.ConnectAsync(remoteEndpoint.Address, remoteEndpoint.Port, cancellationToken);
+                    await ConnectAsync(remoteSocket, remoteEndpoint);
                 }
                 catch (Exception ex)
                 {
                     Log(VerbosityLevel.Standard, $"Failed to connect to remote endpoint {remoteEndpoint}: {ex.Message}. Session ID: {sessionId}");
-                    clientConnection.Close();
+                    clientSocket.Close();
                     ActiveSessions.TryRemove(sessionId, out _);
                     Log(VerbosityLevel.Standard, $"Connection closed. Session ID: {sessionId}. Active sessions: {ActiveSessions.Count}. Reason: Remote connection failed");
                     return;
                 }
 
-                session.SetRemoteConnection(remoteConnection);
+                session.SetRemoteSocket(remoteSocket);
 
                 // Create tasks for forwarding data in both directions
                 var clientToRemoteTask = ForwardDataAsync(
-                    clientConnection, 
-                    remoteConnection, 
+                    clientSocket, 
+                    remoteSocket, 
                     "client → remote", 
                     sessionId, 
                     cancellationToken);
                 
                 var remoteToClientTask = ForwardDataAsync(
-                    remoteConnection, 
-                    clientConnection, 
+                    remoteSocket, 
+                    clientSocket, 
                     "remote → client", 
                     sessionId, 
                     cancellationToken);
@@ -280,9 +333,9 @@ namespace TcpProxy
                 // Wait for either direction to complete (or error)
                 await Task.WhenAny(clientToRemoteTask, remoteToClientTask);
 
-                // Close both connections
-                clientConnection.Close();
-                remoteConnection.Close();
+                // Close both sockets
+                clientSocket.Close();
+                remoteSocket.Close();
             }
             catch (Exception ex)
             {
@@ -298,23 +351,46 @@ namespace TcpProxy
         }
 
         /// <summary>
-        /// Forwards data from one TCP connection to another.
+        /// Connects a socket to a remote endpoint asynchronously.
         /// </summary>
-        /// <param name="source">Source TCP connection</param>
-        /// <param name="destination">Destination TCP connection</param>
+        /// <param name="socket">The socket to connect</param>
+        /// <param name="endpoint">The remote endpoint to connect to</param>
+        /// <returns>A task representing the asynchronous operation</returns>
+        private static Task ConnectAsync(Socket socket, EndPoint endpoint)
+        {
+            var tcs = new TaskCompletionSource<bool>();
+            
+            socket.BeginConnect(endpoint, ar => 
+            {
+                try
+                {
+                    socket.EndConnect(ar);
+                    tcs.SetResult(true);
+                }
+                catch (Exception ex)
+                {
+                    tcs.SetException(ex);
+                }
+            }, null);
+            
+            return tcs.Task;
+        }
+
+        /// <summary>
+        /// Forwards data from one socket to another.
+        /// </summary>
+        /// <param name="source">Source socket</param>
+        /// <param name="destination">Destination socket</param>
         /// <param name="direction">Direction label for logging</param>
         /// <param name="sessionId">Session identifier for logging</param>
         /// <param name="cancellationToken">Cancellation token for shutdown</param>
-        private static async Task ForwardDataAsync(TcpClient source, TcpClient destination, string direction, string sessionId, CancellationToken cancellationToken)
+        private static async Task ForwardDataAsync(Socket source, Socket destination, string direction, string sessionId, CancellationToken cancellationToken)
         {
             byte[] buffer = new byte[8192];
             long totalBytes = 0;
             
             try
             {
-                NetworkStream sourceStream = source.GetStream();
-                NetworkStream destinationStream = destination.GetStream();
-
                 while (!cancellationToken.IsCancellationRequested && source.Connected && destination.Connected)
                 {
                     int bytesRead;
@@ -322,7 +398,7 @@ namespace TcpProxy
                     try
                     {
                         // Read with cancellation support
-                        bytesRead = await sourceStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                        bytesRead = await ReceiveAsync(source, buffer, cancellationToken);
                     }
                     catch (OperationCanceledException)
                     {
@@ -343,8 +419,7 @@ namespace TcpProxy
                     try
                     {
                         // Write with cancellation support
-                        await destinationStream.WriteAsync(buffer, 0, bytesRead, cancellationToken);
-                        await destinationStream.FlushAsync(cancellationToken);
+                        await SendAsync(destination, buffer, bytesRead, cancellationToken);
                         
                         totalBytes += bytesRead;
                         
@@ -380,6 +455,91 @@ namespace TcpProxy
         }
 
         /// <summary>
+        /// Receives data from a socket asynchronously.
+        /// </summary>
+        /// <param name="socket">The socket to receive from</param>
+        /// <param name="buffer">The buffer to receive into</param>
+        /// <param name="cancellationToken">Cancellation token for shutdown</param>
+        /// <returns>The number of bytes received</returns>
+        private static Task<int> ReceiveAsync(Socket socket, byte[] buffer, CancellationToken cancellationToken)
+        {
+            var tcs = new TaskCompletionSource<int>();
+            
+            // Register cancellation
+            var registration = cancellationToken.Register(() => 
+            {
+                tcs.TrySetCanceled();
+            });
+            
+            socket.BeginReceive(buffer, 0, buffer.Length, SocketFlags.None, ar => 
+            {
+                registration.Dispose(); // Unregister cancellation
+                
+                try
+                {
+                    int bytesRead = socket.EndReceive(ar);
+                    tcs.SetResult(bytesRead);
+                }
+                catch (Exception ex)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        tcs.TrySetCanceled();
+                    }
+                    else
+                    {
+                        tcs.TrySetException(ex);
+                    }
+                }
+            }, null);
+            
+            return tcs.Task;
+        }
+
+        /// <summary>
+        /// Sends data to a socket asynchronously.
+        /// </summary>
+        /// <param name="socket">The socket to send to</param>
+        /// <param name="buffer">The buffer to send from</param>
+        /// <param name="bytesToSend">The number of bytes to send</param>
+        /// <param name="cancellationToken">Cancellation token for shutdown</param>
+        /// <returns>A task representing the asynchronous operation</returns>
+        private static Task SendAsync(Socket socket, byte[] buffer, int bytesToSend, CancellationToken cancellationToken)
+        {
+            var tcs = new TaskCompletionSource<bool>();
+            
+            // Register cancellation
+            var registration = cancellationToken.Register(() => 
+            {
+                tcs.TrySetCanceled();
+            });
+            
+            socket.BeginSend(buffer, 0, bytesToSend, SocketFlags.None, ar => 
+            {
+                registration.Dispose(); // Unregister cancellation
+                
+                try
+                {
+                    int bytesSent = socket.EndSend(ar);
+                    tcs.SetResult(true);
+                }
+                catch (Exception ex)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        tcs.TrySetCanceled();
+                    }
+                    else
+                    {
+                        tcs.TrySetException(ex);
+                    }
+                }
+            }, null);
+            
+            return tcs.Task;
+        }
+
+        /// <summary>
         /// Logs a message based on the current verbosity level.
         /// </summary>
         /// <param name="level">Minimum verbosity level required to display this message</param>
@@ -399,37 +559,37 @@ namespace TcpProxy
     class ProxySession
     {
         public string Id { get; }
-        public TcpClient ClientConnection { get; }
-        public TcpClient RemoteConnection { get; private set; }
+        public Socket ClientSocket { get; }
+        public Socket RemoteSocket { get; private set; }
         public IPEndPoint ClientEndpoint { get; }
         public IPEndPoint RemoteEndpoint { get; }
         public DateTime StartTime { get; }
 
-        public ProxySession(string id, TcpClient clientConnection, IPEndPoint clientEndpoint, IPEndPoint remoteEndpoint)
+        public ProxySession(string id, Socket clientSocket, IPEndPoint clientEndpoint, IPEndPoint remoteEndpoint)
         {
             Id = id;
-            ClientConnection = clientConnection;
+            ClientSocket = clientSocket;
             ClientEndpoint = clientEndpoint;
             RemoteEndpoint = remoteEndpoint;
             StartTime = DateTime.Now;
         }
 
-        public void SetRemoteConnection(TcpClient remoteConnection)
+        public void SetRemoteSocket(Socket remoteSocket)
         {
-            RemoteConnection = remoteConnection;
+            RemoteSocket = remoteSocket;
         }
 
         public void Close()
         {
             try
             {
-                ClientConnection?.Close();
+                ClientSocket?.Close();
             }
             catch { /* Ignore errors during cleanup */ }
 
             try
             {
-                RemoteConnection?.Close();
+                RemoteSocket?.Close();
             }
             catch { /* Ignore errors during cleanup */ }
         }
